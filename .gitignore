@@ -1,0 +1,17 @@
+.DS_Store
+__pycache__
+.idea
+.ipynb_checkpoints
+pickhardtpayments/pickhardtpayments.egg-info
+pickhardtpayments/__pycache__
+
+# not including large file with Channel Graph
+pickhardtpayments/listchannels*.json
+pickhardtpayments/channels*.json
+
+# exclude log file
+pickhardt_pay.log
+
+edge_pressure.ipynb
+max_flow_graph.ndjson
+Simulations.ipynb
