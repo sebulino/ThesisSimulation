@@ -15,7 +15,7 @@ from .UncertaintyNetwork import UncertaintyNetwork
 from .OracleLightningNetwork import OracleLightningNetwork
 
 import ortools.graph
-#from ortools.graph import pywrapgraph
+from ortools.graph import pywrapgraph
 
 import time
 import networkx as nx
@@ -369,7 +369,7 @@ class SyncSimulatedPaymentSession:
         # implemented in a concurrent way. Also, we stop after 10 rounds which is pretty arbitrary
         # a better stop criteria would be if we compute infeasible flows or if the probabilities
         # are too low or residual amounts decrease to slowly
-        while amt > 0 and cnt < 10:
+        while amt > 0 and cnt < 5:
             print("Round number: ", cnt + 1)
             print("Try to deliver", amt, "satoshi:")
 
@@ -423,3 +423,11 @@ class SyncSimulatedPaymentSession:
         print("fee for settlement of delivery: {:8.3f} sat --> {} ppm".format(
             payment.settlement_fees/1000, int(payment.settlement_fees * 1000 / payment.total_amount)))
         print("used mu:", mu)
+
+        print("--------")
+        for att in payment.attempts:
+            if att.status == AttemptStatus.SETTLED:
+                for path in att.path:
+                    print(path.src + " to " + path.dest + ", " + str(att.amount))
+            print("- ")
+        print("--------")

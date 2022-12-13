@@ -13,7 +13,7 @@ class OracleChannel(Channel):
     def __init__(self, channel: Channel, actual_liquidity: int = None):
         super().__init__(channel.cln_jsn)
         #self._actual_liquidity = actual_liquidity
-        self._actual_liquidity = 100000
+        self._actual_liquidity = 300000
         #if actual_liquidity is None or actual_liquidity >= self.capacity or actual_liquidity < 0:
         #    self._actual_liquidity = random.randint(0, self.capacity)
 
@@ -37,7 +37,7 @@ class OracleChannel(Channel):
         :param amt: amount to be assigned to channel liquidity
         :type amt: int
         """
-        self._actual_liquidity = 100000
+        self._actual_liquidity = 300000
         #if 0 <= amt <= self.capacity:
         #    self._actual_liquidity = amt
         #else:
