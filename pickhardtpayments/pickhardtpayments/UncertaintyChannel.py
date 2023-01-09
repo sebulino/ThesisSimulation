@@ -1,7 +1,9 @@
+import logging
+
+from .Attempt import AttemptStatus
 from .Channel import Channel
 from .OracleLightningNetwork import OracleLightningNetwork
 from math import log2 as log
-
 
 DEFAULT_MU = 1
 DEFAULT_N = 5
@@ -16,13 +18,13 @@ class UncertaintyChannel(Channel):
     on the capacity of the channel, the class contains the `capacity` as seen in the funding tx output.
 
     As we also optimize for fees and want to be able to compute the fees of a flow ,the class
-    contains information for the feerate (`ppm`) and the base_fee (`base`). 
+    contains information for the fee rate (`ppm`) and the base_fee (`base`).
 
     Most importantly the class stores our belief about the liquidity information of a channel.
     This is done by reducing the uncertainty interval from [0,`capacity`] to 
     [`min_liquidity`, `max_liquidity`].
     Additionally, we need to know how many sats we currently have allocated via outstanding onions
-    to the channel which is stored in `inflight`.
+    to the channel which is stored in `in_flight`.
 
     The most important API call is the `get_piecewise_linearized_costs` function that computes the
     piecewise linearized cost for a channel rising from uncertainty as well as routing fees.
@@ -33,6 +35,10 @@ class UncertaintyChannel(Channel):
 
     def __init__(self, channel: Channel):
         super().__init__(channel.cln_jsn)
+        self._short_channel_id = channel.short_channel_id
+        self._in_flight = None
+        self._min_liquidity = None
+        self._max_liquidity = None
         self.forget_information()
 
     def __str__(self):
@@ -41,29 +47,35 @@ class UncertaintyChannel(Channel):
             self.entropy(),
             self.min_liquidity,
             self.max_liquidity,
-            self.in_flight)
+            self._in_flight)
 
     @property
     def max_liquidity(self):
         return self._max_liquidity
 
+    # FIXME: store timestamps when using setters so that we know when we learnt our belief
+    @max_liquidity.setter
+    def max_liquidity(self, value: int):
+        self._max_liquidity = value
+
     @property
     def min_liquidity(self):
         return self._min_liquidity
-
-    @property
-    def in_flight(self):
-        return self._in_flight
 
     # FIXME: store timestamps when using setters so that we know when we learnt our belief
     @min_liquidity.setter
     def min_liquidity(self, value: int):
         self._min_liquidity = value
 
-    # FIXME: store timestamps when using setters so that we know when we learnt our belief
-    @max_liquidity.setter
-    def max_liquidity(self, value: int):
-        self._max_liquidity = value
+    @property
+    def in_flight(self):
+        """
+        The amount currently allocated for potential payments through this channel. This resembles the concept of an
+        HTLC.
+
+        :return: in_flight amount on the UncertaintyChannel
+        """
+        return self._in_flight
 
     # FIXME: store timestamps when using setters so that we know when we learnt our belief
     @in_flight.setter
@@ -72,21 +84,28 @@ class UncertaintyChannel(Channel):
 
     @property
     def conditional_capacity(self, respect_inflight=True):
+        """
+        Conditional Capacity is the capacity in the channel after we applied our knowledge about minimum liquidity
+        and maximum liquidity.
+        This is done by reducing the uncertainty interval from [0,`capacity`] to [`min_liquidity`, `max_liquidity`].
+
+        :param respect_inflight: are in_flight amounts considered when calculating the conditional capacity?
+        """
         # FIXME: make sure if respect_inflight=True is needed for linearized cost
-        if respect_inflight == False:
+        if not respect_inflight:
             return self.max_liquidity - self.min_liquidity
 
         min_liquidity = max(self.min_liquidity, self.in_flight)
         return max(self.max_liquidity - min_liquidity, 0)
 
-    def allocate_amount(self, amt: int):
+    def allocate_inflights(self, amt: int):
         """
         assign or remove amount that is assigned to be `in_flight`.
         """
         self.in_flight += amt
         if self.in_flight < 0:
             raise Exception(
-                "Can't remove in flight HTLC of amt {} current inflight: {}".format(-amt, self._in_flight-amt))
+                "Can't remove in flight HTLC of amt {} current inflight: {}".format(-amt, self._in_flight - amt))
 
     # FIXME: store timestamps when using setters so that we know when we learnt our belief
     def forget_information(self):
@@ -96,7 +115,7 @@ class UncertaintyChannel(Channel):
         self.min_liquidity = 0
         self.max_liquidity = self.capacity
         # FIXME: Is there a case where we want to keep inflight information but reset information?
-        self.in_flight = 0
+        self._in_flight = 0
 
     def entropy(self):
         """
@@ -111,7 +130,8 @@ class UncertaintyChannel(Channel):
 
     def success_probability(self, amt: int = None):
         """
-        returns the estimated success probability for a payment based on our belief about the channel using a uniform distribution.
+        returns the estimated success probability for a payment based on our belief about the channel using a
+        uniform distribution.
 
         While this is the core of the theory it is only used for evaluation and not for the
         actual min cost flow computation as we linearize this to an integer unit cost
@@ -136,7 +156,7 @@ class UncertaintyChannel(Channel):
             conditional_amount = tested_liquidity - self.min_liquidity
             # TODO: can't use self.condition_capacity as that respects inflight htlcs
             conditional_capacity = self.max_liquidity - self.min_liquidity
-            if conditional_amount > conditional_capacity:
+            if conditional_amount >= conditional_capacity:
                 return 0.
             return float(conditional_capacity + 1 - conditional_amount) / (conditional_capacity + 1)
 
@@ -155,7 +175,7 @@ class UncertaintyChannel(Channel):
         Warning: This API does not respect our belief about the channels liquidity or allocated in_flight HTLCs
         """
         # TODO: Maybe change to `return amt*self.linlinearized_integer_uncertainty_unit_cost()`
-        return float(amt)/(self.capacity+1)
+        return float(amt) / (self.capacity + 1)
 
     def linearized_integer_uncertainty_unit_cost(self, use_conditional_capacity=True):
         """
@@ -163,21 +183,21 @@ class UncertaintyChannel(Channel):
 
         FIXME: Instead of using the maximum capacity on the network it just assumes 150BTC to be max
         """
-        # FIXME: interesting! Quantization does not change unit cost as it cancles itself
+        # FIXME: interesting! Quantization does not change unit cost as it cancels itself
         # FIXME: use max satoshis available and control for quantization (makes mu depend on quantization....)
         if use_conditional_capacity:
             # FIXME: better choice of magic number but TOTAL_NUMBER_OF_SATS breaks solver
-            return int(self.MAX_CHANNEL_SIZE/self.conditional_capacity)
+            return int(self.MAX_CHANNEL_SIZE / max(self.conditional_capacity, 1))
             # return int(self.TOTAL_NUMBER_OF_SATS/self.capacity)
         else:
-            return int(self.MAX_CHANNEL_SIZE/self.capacity)
+            return int(self.MAX_CHANNEL_SIZE / self.capacity)
             # return int(self.TOTAL_NUMBER_OF_SATS/self.conditional_capacity)
 
     def routing_cost_msat(self, amt: int):
         """
         Routing cost a routing node will earn to forward a payment along this channel in msats
         """
-        return int(self.ppm*amt/1000) + self.base_fee
+        return int(self.ppm * amt / 1000) + self.base_fee
 
     def linearized_routing_cost_msat(self, amt: int):
         """
@@ -191,7 +211,7 @@ class UncertaintyChannel(Channel):
         There are other ways of achieving this by overestimating the fee as ZmnSCPxj suggested at:
         https://lists.linuxfoundation.org/pipermail/lightning-dev/2021-August/003206.html
         """
-        return int(self.ppm*amt/1000.)
+        return int(self.ppm * amt / 1000.)
 
     def linearized_integer_routing_unit_cost(self):
         "Note that the ppm is natively an integer and can just be taken as a unit cost for the solver"
@@ -206,27 +226,26 @@ class UncertaintyChannel(Channel):
         """
         return self.linearized_integer_uncertainty_unit_cost() + mu * self.linearized_integer_routing_unit_cost()
 
-    def get_piecewise_linearized_costs(self, number_of_pieces: int = DEFAULT_N,
-                                       mu: int = DEFAULT_MU):
+    def get_piecewise_linearized_costs(self, number_of_pieces: int = DEFAULT_N, mu: int = DEFAULT_MU):
         """
 
         """
         # FIXME: compute smarter linearization eg: http://www.iaeng.org/publication/WCECS2008/WCECS2008_pp1191-1194.pdf
-        pieces = []*number_of_pieces
+        pieces = [] * number_of_pieces
 
         # using certainly available liquidity costs us nothing but fees
-        if int(self.min_liquidity-self.in_flight) > 0:
-            uncertintay_unit_cost = 0  # is zero as we have no uncertainty in this case!
-            pieces.append((int(self.min_liquidity-self.in_flight),
-                           uncertintay_unit_cost + mu * self.linearized_integer_routing_unit_cost()))
+        if int(self.min_liquidity - self.in_flight) > 0:
+            uncertainty_unit_cost = 0  # is zero as we have no uncertainty in this case!
+            pieces.append((int(self.min_liquidity - self.in_flight),
+                           uncertainty_unit_cost + mu * self.linearized_integer_routing_unit_cost()))
             number_of_pieces -= 1
 
         # FIXME: include the in_flight stuff
         if int(self.conditional_capacity) > 0 and number_of_pieces > 0:
-            arc_capacity = int(self.conditional_capacity/number_of_pieces)
-            uncertintay_unit_cost = self.linearized_integer_uncertainty_unit_cost()
+            arc_capacity = int(self.conditional_capacity / number_of_pieces)
+            uncertainty_unit_cost = self.linearized_integer_uncertainty_unit_cost()
             for i in range(number_of_pieces):
-                pieces.append((arc_capacity, (i+1)*uncertintay_unit_cost +
+                pieces.append((arc_capacity, (i + 1) * uncertainty_unit_cost +
                                mu * self.linearized_integer_routing_unit_cost()))
         return pieces
 
@@ -244,33 +263,153 @@ class UncertaintyChannel(Channel):
 
         #using certainly available liquidity costs us nothing but fees
         if int((self.min_liquidity-self.in_flight)/quantization) > 0:
-            uncertintay_unit_cost = 0 #is zero as we have no uncertainty in this case!
+            uncertainty_unit_cost = 0 #is zero as we have no uncertainty in this case!
             pieces.append((int((self.min_liquidity-self.in_flight)/quantization),uncertintay_unit_cost + mu * self.linearized_integer_routing_unit_cost()))
             number_of_pieces-=1
 
         # FIXME: include the in_flight stuff
         if int(self.conditional_capacity/quantization) > 0 and number_of_pieces > 0:
             capacity = int(self.conditional_capacity/(number_of_pieces*quantization))
-            uncertintay_unit_cost = self.linearized_integer_uncertainty_unit_cost()
+            uncertainty_unit_cost = self.linearized_integer_uncertainty_unit_cost()
             for i in range(number_of_pieces):
-                a = (i+1)*uncertintay_unit_cost+1
+                a = (i+1)*uncertainty_unit_cost+1
                 b = self.linearized_integer_routing_unit_cost()+1
                 pieces.append((capacity, int(a*b/(a+mu*b)) ))
         return pieces
     """
 
-    def update_knowledge(self, amt: int, success_of_probe):
+    def update_knowledge(self, amount: int, return_channel, probing_successful: bool):
         """
-        updates our knowledge about the channel if we tried to probe it for amount `amt`
+        Updates our knowledge about the channel after probing with 'send_onion'.
 
-        This API works only if we have an Oracle that allows to ask the actual liquidity of a channel
-        In mainnet Lightning our oracle will not work on a per_channel level. This will change the data
-        flow. Here for simplicity of the simulation we make use of the Oracle on a per channel level
+        'send_onion' already placed the amount as inflight on the UncertaintyChannel.
+
+        What can we learn from a successfully sent onion?
+        * If we knew that there was a minimum liquidity greater than 0 on the channel, this liquidity is now reduced.
+        * If there was no knowledge about the minimum liquidity, it is still at zero, because the previous liquidity in
+          the channel is now frozen and thus taken away.
+        * The amount of this attempt has been added to the in_flight amount of the channel, so we know that maximum
+          liquidity is now at most the capacity reduced by the amount of inflights.
+        * Regarding the return channel: We now know that the inflight amount of this channel will be added to the
+          liquidity of the return channel. Thus, minimum liquidity will be increased to at least the in_flight amount.
+          However, we don't know if the minimum liquidity in the return channel already incorporated previous learning
+          and the current inflight amount. but we do know that we have a new maximum liquidity in the channel and the
+          minimum liquidity in the return channel will also be higher than (capacity - the channel's maximum liquidity).
+          If the minimum liquidity in the channel is reduced, this is mirrored in the maximum liquidity of the return
+          channel. Maximum liquidity in the return channel is now capacity minus minimum liquidity in the channel.
+        This might be conservative estimates, maximum can be lower and minimum higher, but at least these are safe
+        assumptions.
+
+        What can we learn from a failing onion?
+        * In the channel, the minimum liquidity estimate was wrong and needs to be moved to the failing amount minus 1
+          or reset completely. We have no further information about the maximum amount that can be sent.
+        * If this amount fails, then we know that at least this amount of liquidity is in the return channel.
+
+
+        # This API works only if we have an Oracle that allows to ask the actual liquidity of a channel
+        # In mainnet Lightning our oracle will not work on a per_channel level. This will change the data
+        # flow. Here for simplicity of the simulation we make use of the Oracle on a per channel level
+
+        :param amount: The amount that went through when probing the channel, usually in_flight amount plus attempt amount!
+        :type: int
+        :param return_channel: The UncertaintyChannel in the return direction, needed to adjust knowledge there.
+        :type: UncertaintyChannel
+        :param probing_successful: Could the amount be sent?
+        :type: bool
         """
-        if success_of_probe:
-            self.min_liquidity = max(self.min_liquidity, self.in_flight+amt)
+        # Fixme: This reflects the situation BEFORE decreasing liquidity by capturing liquidity in the inflight amonut.
+        #
+        # send_onion tries to send an amount through the channel and depending on the amount, the following
+        # situations A, B and C can occur:
+        #
+        # channel:
+        #         A             B                          C
+        #  |......i......|......i...................|......i................|
+        #  |             |                          |                       |
+        #  0          min_liq                    max_liq                    channel_capacity (cap)
+        #
+        #
+        # return_channel:
+        #       cap - C                             cap - B       cap - A
+        #  |......i................|...................i......|......i......|
+        #  |                       |                          |             |
+        #  0                    min_liq                     max_liq         channel_capacity (cap)
+        #                (cap - channel_max_liq)      (cap - channel_min_liq)
+        #
+        #
+        # If **probing_successful**, then all inflights on the UncertaintyChannel did go through. This means that there
+        # is at minimum an amount of A/B/C as available liquidity in the channel. In consequence, I can learn about the
+        # minimum liquidity in the channel, but nothing about the maximum (unless it was below A/B/C)
+        # The tested amount could fall in one of three possible cases:
+        # A: min_liquidity in channel needs to be moved to A, max_liquidity is fine.
+        # B: min_liquidity in channel needs to be moved to B, max_liquidity is fine.
+        # C: min_liquidity in channel need to be moved to C, max_liquidity needs to be scrapped (safety measure,
+        #    it seemed to have gone completely wrong... ok, probably just payments from other nodes we were unaware of).
+        # This means:
+        #   * minimum liquidity is max of previous min liquidity and inflights.
+        #   * maximum liquidity stays as is, or if inflights are higher than previous max liquidity it's set to
+        #     capacity.
+        #
+        # For the return_channel: I know that I can at maximum receive an amount of (capacity - A/B/C). In consequence,
+        # I can learn about my maximum, but nothing about my minimum (unless it was off and above capacity - inflights)
+        # The tested amount could fall in one of three possible cases:
+        # A: max_liquidity is fine, min_liquidity is at least capacity - A,
+        # B: max_liquidity is the lower of current max_liquidity or (cap - B),
+        #    min_liquidity is fine.
+        # C: max_liquidity is the lower of current max_liquidity or (cap - C), and
+        #    min_liquidity in return_channel should better be scrapped (safety measure)
+        # This means:
+        #   * minimum liquidity stays as is, or if (capacity - inflights) is lower than previous min_liquidity, then
+        #     it's reset to 0.
+        #   * maximum liquidity is the minimum of the previous maximum liquidity and (capacity - inflights)
+        #
+        #
+        # If probing is **not successful**, then the sum of inflights on the UncertaintyChannel did not go through.
+        # In consequence, I can learn nothing about my maximum liquidity, unless it was above A/B/C.
+        # The situation can be one of three possible cases on the channel:
+        # A: min_liquidity needs to be scrapped (safety measure) and max_liquidity in channel need to be moved to A.
+        # B: min_liquidity in channel is probably right, max_liquidity needs to be set to B.
+        # C: min_liquidity in channel is probably right, and max_liquidity was probably right.
+        # This means:
+        #   * maximum liquidity is minimum of previous maximum liquidity and inflights.
+        #   * minimum liquidity stays as is, unless inflights are lower than previous min liquidity. Then it's set to 0.
+        #
+        # For the return_channel: I know that I can at minimum receive an amount of capacity - A/B/C. In consequence,
+        # I can learn nothing about my maximum, unless it was set wrong, i.e. lower than capacity - A/B/C.
+        # A: min_liquidity is at least (capacity - A). max_liquidity was probably all wrong and should be set to
+        #    capacity as a safety measure.
+        # B: min_liquidity is at least (capacity - B). max_liquidity is probably right.
+        # C: min_liquidity in return_channel should larger of (capacity - C) and previous min_liquidity. max_liquidity
+        #    is probably right.
+        # This means:
+        #    * minimum liquidity is max of (capacity - inflights) and previous minimum liquidity
+        #    * maximum liquidity should be set to capacity as a safety measure if (capacity - inflights) is larger than
+        #      maximum liquidity.
+
+        if probing_successful:
+            self.min_liquidity = max(self.min_liquidity - amount, 0)
+            self.max_liquidity = self.max_liquidity - self.in_flight
+            # logging.warning(f"placed {self.min_liquidity} as min and {self.max_liquidity} as max liquidity, "
+            #                 f"while {self.in_flight} is inflight")
+
+            if return_channel:
+                return_channel.min_liquidity = max(return_channel.min_liquidity,
+                                                   self.in_flight,
+                                                   self.capacity - self.max_liquidity)
+                return_channel.max_liquidity = return_channel.capacity - self.min_liquidity
+                # logging.debug(f"return_channel.min_liquidity {return_channel.min_liquidity}, "
+                #                 f"return_channel.max_liquidity {return_channel.max_liquidity}")
+            else:
+                logging.debug(f"no return channel in UncertaintyNetwork for {self.short_channel_id}")
+        elif not probing_successful:
+            self.min_liquidity = max(min(self.min_liquidity, self.in_flight - 1), 0)
+
+            if return_channel:
+                return_channel.min_liquidity = max(return_channel.min_liquidity, self.in_flight)
+            else:
+                logging.debug(f"no return channel in UncertaintyNetwork for {self.short_channel_id}")
         else:
-            self.max_liquidity = min(self.max_liquidity, self.in_flight+amt)
+            logging.error("error in update knowledge - wrong status")
 
     # needed for BOLT14 test experiment
     def learn_n_bits(self, oracle: OracleLightningNetwork, n: int = 1):
@@ -283,9 +422,9 @@ class UncertaintyChannel(Channel):
         if n <= 0:
             return
         amt = self.min_liquidity + \
-            int((self.max_liquidity - self.min_liquidity)/2)
+              int((self.max_liquidity - self.min_liquidity) / 2)
         oracle_channel = oracle.get_channel(
             self.src, self.dest, self.short_channel_id)
         success_of_probing = oracle_channel.can_forward(amt)
         self.update_knowledge(amt, success_of_probing)
-        self.learn_n_bits(oracle, n-1)
+        self.learn_n_bits(oracle, n - 1)
