@@ -4,18 +4,21 @@ import ndjson
 import random
 import networkx as nx
 
-from pickhardtpayments.pickhardtpayments import *
+from pickhardtpayments.pickhardtpayments.ChannelGraph import ChannelGraph
+from pickhardtpayments.pickhardtpayments.OracleLightningNetwork import OracleLightningNetwork
+from pickhardtpayments.pickhardtpayments.SyncSimulatedPaymentSession import SyncSimulatedPaymentSession
+from pickhardtpayments.pickhardtpayments.UncertaintyNetwork import UncertaintyNetwork
 
 
 # ===== UTILITY FUNCTIONS FOR GRAPH PREPARATION =====
 def remove_channels_with_min_fee(_graph: ChannelGraph, base_threshold=0):
-    ebunch = []
+    channels_to_remove = []
     for edge in _graph.network.edges:
         ch = _graph.get_channel(edge[1], edge[0], edge[2])
         if ch and ch.base_fee > base_threshold:
-            ebunch.append((edge[0], edge[1], edge[2]))
-    _graph.network.remove_edges_from(ebunch)
-    if len(ebunch) == 0:
+            channels_to_remove.append((edge[0], edge[1], edge[2]))
+    _graph.network.remove_edges_from(channels_to_remove)
+    if len(channels_to_remove) == 0:
         logging.info("no channels with base fee.")
     else:
         logging.info("channels with base fee removed.")
@@ -23,13 +26,13 @@ def remove_channels_with_min_fee(_graph: ChannelGraph, base_threshold=0):
 
 
 def only_channels_with_return_channels(_graph: ChannelGraph):
-    ebunch = []
+    channels_to_remove = []
     for edge in _graph.network.edges:
         return_edge = _graph.get_channel(edge[1], edge[0], edge[2])
         if not return_edge:
-            ebunch.append((edge[0], edge[1], edge[2]))
-    _graph.network.remove_edges_from(ebunch)
-    if len(ebunch) == 0:
+            channels_to_remove.append((edge[0], edge[1], edge[2]))
+    _graph.network.remove_edges_from(channels_to_remove)
+    if len(channels_to_remove) == 0:
         logging.info("channel graph only had channels in both directions.")
     else:
         logging.info("channel graph had unannounced channels.")
@@ -89,8 +92,9 @@ def eliminate_payments_between_unconnected_nodes(min_capacity: int):
 
 def write_central_nodes():
     oracle_lightning_network = OracleLightningNetwork(graph)
-    bet_centr = nx.betweenness_centrality(oracle_lightning_network.network, normalized=True, endpoints=False)
-    sorted_nodes_by_centrality = sorted(bet_centr.items(), key=lambda x: x[1], reverse=True)
+    betweenness_centrality = nx.betweenness_centrality(oracle_lightning_network.network, normalized=True,
+                                                       endpoints=False)
+    sorted_nodes_by_centrality = sorted(betweenness_centrality.items(), key=lambda x: x[1], reverse=True)
     with open("data/nodes_sorted_by_betweenness_centrality_basecase.json", "w") as write_file:
         json.dump(sorted_nodes_by_centrality, write_file, indent=4)
 
@@ -102,16 +106,24 @@ def get_central_nodes(n: int) -> list:
 
 
 # ===== SETUP =====
+# Create base graph from gossip in LN
 graph = ChannelGraph("listchannels20230114.json")
 
+# Definition of payment sample for simulation
 min_payment_amount = 10000
 max_payment_amount = 1000000
 payment_pairs = 10000
 
-# remove channels with base fee
+# remove channels with base fee larger than 0
 graph = remove_channels_with_min_fee(graph, 0)
-graph = only_channels_with_return_channels(graph)
 
+# only include channels with return channels in graph.
+# Without return channels, no settlement is possible.
+# We prefer deletion to assume details about return channel characteristics.
+graph = only_channels_with_return_channels(graph)
+# eliminate_payments_between_unconnected_nodes(min_payment_amount)
+
+# Setup area for further graph manipulation, centrality
 delete_n_central_nodes = 0
 central_nodes = get_central_nodes(delete_n_central_nodes)
 oln = OracleLightningNetwork(graph)
@@ -120,18 +132,24 @@ if delete_n_central_nodes > 0:
     for i in range(0, delete_n_central_nodes):
         oln.network.remove_node(central_nodes[i][0])
 
-initial_payments_file_name = "data/random_graph_06_initial_payments.ndjson"
-create_payments(oln, payment_pairs, min_payment_amount, max_payment_amount)
+# Defining location for data sets.
+initial_payments_file_name = "data/1337_initial_payments.ndjson"
+connected_pairs_file_name = "data/connected_pairs_payments.ndjson"
 
-# eliminate_payments_between_unconnected_nodes(min_payment_amount)
+# == Creation of payment sets for analysis (comment out if working on existing data set) ===
+# create_payments(oln, payment_pairs, min_payment_amount, max_payment_amount)
+
 logging.info("Setup finished")
 logging_level = logging.ERROR
 logger = logging.getLogger()
 logger.setLevel(logging_level)
 loglevel = "error"
 
-# ===== UTILITY FUNCTIONS FOR SIMULATION =====
+# ===== SIMULATION/LOOP METHODS CALLING SPECIFIC PAYMENT DELIVERY METHODS =====
+
+# to organize file output, determine prefix
 results_prefix = "random_graph"
+
 
 def dijkstra_fee(_payment_set, _graph):
     logging.error("===== Dijkstra on fees =====")
@@ -278,7 +296,7 @@ def dijkstra_mixed(_payment_set, _graph):
     # initialisation
     _uncertainty_network = UncertaintyNetwork(_graph)
     _oracle_lightning_network = OracleLightningNetwork(_graph)
-    if central_nodes > 0:
+    if delete_n_central_nodes > 0:
         for i in range(0, delete_n_central_nodes):
             _oracle_lightning_network.network.remove_node(central_nodes[i][0])
             _uncertainty_network.network.remove_node(central_nodes[i][0])
@@ -494,7 +512,7 @@ def pickhardtpay_mixed(_payment_set, _graph):
     # initialisation
     _uncertainty_network = UncertaintyNetwork(_graph)
     _oracle_lightning_network = OracleLightningNetwork(_graph)
-    if central_nodes > 0:
+    if delete_n_central_nodes > 0:
         for i in range(0, delete_n_central_nodes):
             _oracle_lightning_network.network.remove_node(central_nodes[i][0])
             _uncertainty_network.network.remove_node(central_nodes[i][0])
@@ -640,42 +658,83 @@ def pickhardtpay_probability_with_retained_knowledge(_payment_set, _oracle_light
 
 
 # ===== SIMULATION =====
-from datetime import datetime
 
 logging.info("===== start simulation =====")
 payment_set = ndjson.load(open(initial_payments_file_name, "r"))
-# payment_set = payment_set[0:50]
+payment_set = payment_set[0:1]
+
+# == select which payment delivery methods to run the simulation for ==
 
 dijkstra_fee(payment_set, graph)
-dijkstra_probability(payment_set, graph)
+# dijkstra_probability(payment_set, graph)
 # dijkstra_mixed(payment_set, graph)
-pickhardtpay_fee(payment_set, graph)
-pickhardtpay_probability(payment_set, graph)
+# pickhardtpay_fee(payment_set, graph)
+# pickhardtpay_probability(payment_set, graph)
 # pickhardtpay_mixed(payment_set, graph)
 
-# code that is useful for centrality calculations
-oracle_network = OracleLightningNetwork(graph)
+
+# == TESTING INTEGRITY OF THE SIMULATION ==
+
+# did the liquidity guess improve?
 uncertainty_network = UncertaintyNetwork(graph)
-print("nodes in oracle network before deletion ", len(oracle_network.network.nodes))
-if delete_n_central_nodes > 0:
-    for i in range(0, delete_n_central_nodes):
-        oracle_network.network.remove_node(central_nodes[i][0])
-        uncertainty_network.network.remove_node(central_nodes[i][0])
-logging.warning("deleting {} most central nodes done".format(delete_n_central_nodes))
-print("nodes in oracle network after deletion: ", len(oracle_network.network.nodes))
+oracle_network = OracleLightningNetwork(graph)
+liquidity_guess_apriori = []
+# uncomment following line, if working on existing data
+# liquidity_guess_apriori = ndjson.load(open("data/liquidity_guess_apriori.ndjson", "r"))
+
+for ch in uncertainty_network.network.edges:
+    channel = uncertainty_network.get_channel(ch[0], ch[1], ch[2])
+    liquidity_range = channel.max_liquidity - channel.min_liquidity
+    oracle_channel = oracle_network.get_channel(ch[0], ch[1], ch[2])
+    liquidity_hit = (oracle_channel.actual_liquidity <= channel.max_liquidity) and \
+                    (oracle_channel.actual_liquidity >= channel.min_liquidity)
+    liquidity_guess_apriori.append(
+        (liquidity_range, channel.capacity, liquidity_range / channel.capacity, liquidity_hit,
+         ch[0], ch[1], ch[2], oracle_channel.actual_liquidity))
+
+# uncomment following line so save data for further analysis
+# ndjson.dump(liquidity_guess_apriori, open("data/_liquidity_guess_apriori.ndjson", "w"))
 
 pickhardtpay_probability_with_retained_knowledge(payment_set, oracle_network, uncertainty_network)
 
+liquidity_guess_aposteriori = []
+# liquidity_guess_aposteriori = ndjson.load(open("data/liquidity_guess_aposteriori.ndjson", "r"))
 
-## Data collection
+for ch in uncertainty_network.network.edges:
+    channel = uncertainty_network.get_channel(ch[0], ch[1], ch[2])
+    liquidity_range = channel.max_liquidity - channel.min_liquidity
+    oracle_channel = oracle_network.get_channel(ch[0], ch[1], ch[2])
+    liquidity_hit = (oracle_channel.actual_liquidity <= channel.max_liquidity) and \
+                    (oracle_channel.actual_liquidity >= channel.min_liquidity)
+    liquidity_guess_aposteriori.append(
+        (liquidity_range, channel.capacity, "{:.2f}".format(liquidity_range / channel.capacity),
+         liquidity_hit, ch[0], ch[1], ch[2], oracle_channel.actual_liquidity,
+         channel.min_liquidity, channel.max_liquidity))
+# ndjson.dump(liquidity_guess_aposteriori, open("data/_liquidity_guess_aposteriori.ndjson", "w"))
 
+prediction_range_difference = 0
+false_guess = 0
+initial_range = 0
+
+for i in range(len(liquidity_guess_apriori)):
+    initial_range += liquidity_guess_apriori[i][0]
+    prediction_range_difference += liquidity_guess_apriori[i][0] - liquidity_guess_aposteriori[i][0]
+    if not liquidity_guess_aposteriori[i][3]:
+        print(liquidity_guess_aposteriori[i])
+        false_guess += 1
+
+print("number of false guesses: ", false_guess)
+print(f"overall estimate improved by {prediction_range_difference:,}, was initially: {initial_range:,}")
+print(f"improvement by {prediction_range_difference / initial_range:,}")
+
+# == aggregate results in one file ==
 method_all = ["_dijkstra_fee", "_dijkstra_probability", "_dijkstra_mixed", "_pickhardtpay_fee", "_pickhardtpay_prob",
               "_pickhardtpay_mixed", "_retained_knowledge_pickhardtpay_prob"]
 method_short = ["_dijkstra_fee", "_dijkstra_probability", "_pickhardtpay_fee", "_pickhardtpay_prob",
                 "_retained_knowledge_pickhardtpay_prob"]
-
 all_results = []
 for m in method_short:
     file = "data/" + results_prefix + m + ".ndjson"
     all_results += ndjson.load(open(file, "r"))
-ndjson.dump(all_results, open(file, "w"))
+
+ndjson.dump(all_results, open("data/all_results.ndjson", "w"))
